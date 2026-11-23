@@ -6,6 +6,9 @@ from io import BytesIO
 import base64
 import os
 
+import pymupdf  # PDF/AI — licença AGPL (ver nota)
+from defusedxml import ElementTree as DET
+
 # ── Config ──────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Stampa Checker",
@@ -527,227 +530,492 @@ def render_suggestion(icon, title, text):
     """
 
 
+
+# ── Vetorização ─────────────────────────────────────────────────────────────
+VECTOR_EXTS = ("svg", "pdf", "ai")
+RASTER_EXTS = ("png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp")
+SVG_VECTOR_TAGS = {"path", "rect", "circle", "ellipse", "line", "polyline", "polygon", "text"}
+MAX_PDF_PAGES = 20          # evita travar o app com PDFs enormes
+RASTER_COVERAGE_LIMIT = 0.9  # imagem cobrindo >=90% da página = arte raster "embrulhada"
+
+
+def classify_vector(n_vec: int, n_img: int, coverage: float | None = None) -> dict:
+    """Classifica em vetorial / misto / raster embutido a partir das contagens."""
+    if n_img == 0 and n_vec > 0:
+        return {"label": "VETORIAL", "cls": "approved", "icon": "✅",
+                "desc": "Somente elementos vetoriais. Escala sem perda para qualquer tamanho."}
+    if n_img == 0 and n_vec == 0:
+        return {"label": "NADA DETECTADO", "cls": "warning", "icon": "⚠️",
+                "desc": "Nenhum vetor nem imagem encontrados. Arquivo vazio ou formato não suportado."}
+    if n_vec <= 2 or (coverage is not None and coverage >= RASTER_COVERAGE_LIMIT):
+        return {"label": "NÃO É VETOR (IMAGEM EMBUTIDA)", "cls": "rejected", "icon": "❌",
+                "desc": "O arquivo tem extensão vetorial, mas a arte é uma imagem raster dentro dele. "
+                        "Vale a resolução da imagem embutida."}
+    return {"label": "MISTO (VETOR + IMAGEM)", "cls": "warning", "icon": "⚠️",
+            "desc": "Parte vetorial, parte raster. Os trechos em imagem dependem da resolução embutida."}
+
+
+def analyze_svg(data: bytes) -> dict:
+    root = DET.fromstring(data)  # defusedxml: bloqueia XXE / billion laughs
+    counts: dict[str, int] = {}
+    images = []
+    for el in root.iter():
+        if not isinstance(el.tag, str):
+            continue
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag in SVG_VECTOR_TAGS:
+            counts[tag] = counts.get(tag, 0) + 1
+        elif tag == "image":
+            href = el.get("href") or el.get("{http://www.w3.org/1999/xlink}href") or ""
+            info = {"embedded": href.startswith("data:"), "px": None}
+            if info["embedded"] and "base64," in href:
+                try:
+                    raw = base64.b64decode(href.split("base64,", 1)[1])
+                    with Image.open(BytesIO(raw)) as im:
+                        info["px"] = im.size
+                except Exception:
+                    pass
+            images.append(info)
+
+    n_vec = sum(counts.values())
+    preview_html = (
+        f'<img src="data:image/svg+xml;base64,{base64.b64encode(data).decode()}" '
+        'style="max-width:100%; max-height:520px;">'
+    )  # <img> não executa scripts do SVG
+    return {
+        "kind": "SVG", "n_vec": n_vec, "vec_detail": counts, "n_img": len(images),
+        "images": images, "coverage": None, "pages": 1, "pages_analyzed": 1,
+        "verdict": classify_vector(n_vec, len(images)), "preview_html": preview_html,
+    }
+
+
+def analyze_pdf(data: bytes, kind: str) -> dict:
+    """PDF e AI (AI moderno é salvo com compatibilidade PDF)."""
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    try:
+        pages = min(doc.page_count, MAX_PDF_PAGES)
+        n_draw = n_text = 0
+        images = []
+        img_area = page_area = 0.0
+        for i in range(pages):
+            page = doc[i]
+            pr = page.rect
+            page_area += pr.width * pr.height
+            n_draw += len(page.get_drawings())
+            n_text += len(page.get_text("words"))  # texto com fonte também é vetor
+            for img in page.get_images(full=True):
+                xref, w_px, h_px = img[0], img[2], img[3]
+                for r in page.get_image_rects(xref):
+                    visible = r & pr
+                    if visible.is_empty or r.width <= 0 or r.height <= 0:
+                        continue
+                    img_area += visible.width * visible.height
+                    dpi = min(w_px / (r.width / 72), h_px / (r.height / 72))
+                    images.append({"page": i + 1, "px": (w_px, h_px), "dpi": round(dpi),
+                                   "cm": (round(r.width / 72 * 2.54, 1), round(r.height / 72 * 2.54, 1))})
+
+        coverage = min(img_area / page_area, 1.0) if page_area else 0.0
+        p0 = doc[0]
+        zoom = 1000 / max(p0.rect.width, p0.rect.height, 1)
+        preview_png = p0.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom)).tobytes("png")
+        n_vec = n_draw + n_text
+        return {
+            "kind": kind, "n_vec": n_vec,
+            "vec_detail": {"formas/traçados": n_draw, "palavras de texto": n_text},
+            "n_img": len(images), "images": images, "coverage": coverage,
+            "pages": doc.page_count, "pages_analyzed": pages,
+            "verdict": classify_vector(n_vec, len(images), coverage), "preview_png": preview_png,
+        }
+    finally:
+        doc.close()
+
+
+def analyze_raster_vectorizability(img: Image.Image) -> dict:
+    """Raster nunca é vetor; estima se é arte chapada (fácil de vetorizar) ou foto/degradê."""
+    small = img.convert("RGBA")
+    small.thumbnail((512, 512))
+    arr = np.array(small)
+    opaque = arr[:, :, 3] > 128
+    rgb = (arr[:, :, :3][opaque] >> 3).astype(np.int32)  # 5 bits/canal absorve anti-aliasing
+    if len(rgb) == 0:
+        top16 = 0.0
+    else:
+        keys = (rgb[:, 0] << 10) | (rgb[:, 1] << 5) | rgb[:, 2]
+        _, freq = np.unique(keys, return_counts=True)
+        top16 = float(np.sort(freq)[::-1][:16].sum() / len(keys) * 100)
+    if top16 >= 85:
+        level = ("Fácil", "green", "Arte chapada com poucas cores — vetoriza bem (Image Trace / vectorizer.ai).")
+    elif top16 >= 55:
+        level = ("Médio", "orange", "Muitas cores ou degradês — o traçado automático exige revisão manual.")
+    else:
+        level = ("Difícil", "red", "Aparência fotográfica/pintada — vetorizar perde detalhe; mantenha em alta resolução.")
+    return {"top16_pct": top16, "level": level}
+
+
+
 # ── Header ──────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="app-header">
     <div>
         <h1>🔍 STAMPA CHECKER</h1>
-        <p class="subtitle">Análise de qualidade para estampas</p>
+        <p class="subtitle">Análise de qualidade e vetorização para estampas</p>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Upload ──────────────────────────────────────────────────────────────────
-if "analyzed" not in st.session_state:
-    st.session_state.analyzed = False
 
-col_upload, col_spacer = st.columns([1, 2])
+tab_dpi, tab_vec = st.tabs(["🔍 Análise de DPI", "🧬 Verificar Vetorização"])
 
-with col_upload:
-    st.markdown("""
-    <div class="card">
-        <div class="card-title">📤 Upload da Estampa</div>
-        <p style="font-size:0.85rem; color:#5f6368; margin-bottom:0.5rem;">
-            Arraste ou selecione a imagem para análise.<br>
-            Suporta PNG, JPG, TIFF, BMP, WEBP.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+# ── Aba: Análise de DPI ─────────────────────────────────────────────────────
+with tab_dpi:
+    # ── Upload ──────────────────────────────────────────────────────────────────
+    if "analyzed" not in st.session_state:
+        st.session_state.analyzed = False
 
-uploaded = st.file_uploader(
-    "upload",
-    type=["png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp"],
-    label_visibility="collapsed",
-)
+    col_upload, col_spacer = st.columns([1, 2])
 
-# ── Análise ─────────────────────────────────────────────────────────────────
-if uploaded is not None:
-    file_bytes = uploaded.getvalue()
-    file_size = len(file_bytes)
-
-    try:
-        img = Image.open(BytesIO(file_bytes))
-    except Exception as e:
-        st.error(f"Erro ao abrir a imagem: {e}")
-        st.stop()
-
-    with st.spinner("Analisando imagem..."):
-        tech = analyze_technical(img, file_size)
-        quality = analyze_quality(img, tech)
-
-    dpi_eff = get_dpi_effective(tech["width"], tech["height"])
-    res_label, res_color_name = get_resolution_label(tech["width"], tech["height"])
-    sharp_label = get_sharpness_label(tech["laplacian_var"])
-
-    # ── Layout principal ────────────────────────────────────────────────
-    col_preview, col_metrics = st.columns([3, 2])
-
-    # Preview da imagem
-    with col_preview:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="card-title">🖼️ Preview — {uploaded.name}</div>', unsafe_allow_html=True)
-        st.image(img, use_container_width=True)
-
-        # Tags de info rápida
-        tags_html = f"""
-        <div style="margin-top:0.8rem;">
-            <span class="tech-detail">📐 {tech['width']}×{tech['height']} px</span>
-            <span class="tech-detail">📁 {tech['format']}</span>
-            <span class="tech-detail">💾 {tech['file_size']/1024:.0f} KB</span>
-            <span class="tech-detail">🎨 {tech['mode']} ({tech['bits']}bits)</span>
-            <span class="tech-detail">🔢 {tech['unique_colors']:,} cores</span>
-        """
-        if tech.get("has_transparency"):
-            tags_html += '<span class="tech-detail">✅ Transparência</span>'
-        else:
-            tags_html += '<span class="tech-detail">❌ Sem transparência</span>'
-        if tech.get("icc"):
-            tags_html += '<span class="tech-detail">✅ ICC</span>'
-        else:
-            tags_html += '<span class="tech-detail">⚠️ Sem ICC</span>'
-        tags_html += "</div>"
-        st.markdown(tags_html, unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # Métricas e veredito
-    with col_metrics:
-        # Card de métricas
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">📊 Análise</div>', unsafe_allow_html=True)
-
-        dpi_icon_class = "green" if dpi_eff >= 300 else ("orange" if dpi_eff >= 150 else "red")
-        dpi_label = "Excelente" if dpi_eff >= 300 else ("Boa" if dpi_eff >= 200 else ("Mínima" if dpi_eff >= 150 else "Insuficiente"))
-
-        metrics_html = ""
-        metrics_html += render_metric("📐", dpi_icon_class, "RESOLUÇÃO EFETIVA (DPI P/ 25×30CM)", f"{dpi_eff} DPI ({dpi_label})")
-        metrics_html += render_metric("🎨", "blue" if tech["unique_colors"] >= 10000 else "orange", "QUALIDADE DE PX", f"{res_label} ({tech['width']}×{tech['height']})")
-
-        contrast_val = tech.get("lum_std", 0)
-        contrast_label = "Alto" if contrast_val > 40 else ("Médio" if contrast_val > 20 else "Baixo")
-        contrast_class = "green" if contrast_val > 40 else ("orange" if contrast_val > 20 else "red")
-        metrics_html += render_metric("🔲", contrast_class, "CONTRASTE", f"{contrast_label} ({contrast_val:.1f})")
-
-        metrics_html += render_metric("✨", "purple", "NITIDEZ", f"{sharp_label}")
-
-        ps300 = tech["print_sizes"][300]
-        print_class = "green" if ps300[0] >= 25 else ("orange" if ps300[0] >= 15 else "red")
-        metrics_html += render_metric("🖨️", print_class, "IMPRESSÃO A 300 DPI", f"{ps300[0]}×{ps300[1]} cm")
-
-        st.markdown(metrics_html, unsafe_allow_html=True)
-
-        # Veredito
-        st.markdown(f"""
-        <div class="verdict {quality['verdict_class']}">
-            <div class="verdict-label">VEREDITO</div>
-            <div class="verdict-text">{quality['verdict_icon']} {quality['verdict']}</div>
+    with col_upload:
+        st.markdown("""
+        <div class="card">
+            <div class="card-title">📤 Upload da Estampa</div>
+            <p style="font-size:0.85rem; color:#5f6368; margin-bottom:0.5rem;">
+                Arraste ou selecione a imagem para análise.<br>
+                Suporta PNG, JPG, TIFF, BMP, WEBP.
+            </p>
         </div>
         """, unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Linha 2: Notas + Sugestões ──────────────────────────────────────
-    st.markdown("<br>", unsafe_allow_html=True)
-    col_scores, col_suggestions = st.columns([1, 1])
+    uploaded = st.file_uploader(
+        "upload",
+        key="dpi_uploader",
+        type=["png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp"],
+        label_visibility="collapsed",
+    )
 
-    with col_scores:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">📈 Notas</div>', unsafe_allow_html=True)
-        scores = quality["scores"]
-        bars = ""
-        bars += render_score_bar("Qualidade Técnica", scores["technical"])
-        bars += render_score_bar("Qualidade Visual", scores["visual"])
-        bars += render_score_bar("Prep. Impressão", scores["print"])
-        st.markdown(bars, unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+    # ── Análise ─────────────────────────────────────────────────────────────────
+    if uploaded is not None:
+        file_bytes = uploaded.getvalue()
+        file_size = len(file_bytes)
 
-        # Tabela de impressão
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">🖨️ Tamanhos de Impressão</div>', unsafe_allow_html=True)
-        table_rows = ""
-        for ppi in [300, 200, 150]:
-            ps = tech["print_sizes"][ppi]
-            quality_label = "Ótima" if ppi == 300 else ("Boa" if ppi == 200 else "Mínima")
-            ok = "✅" if ps[0] >= 20 or ps[1] >= 20 else "❌"
-            table_rows += f"<tr><td>{ppi} PPI</td><td>{quality_label}</td><td>{ps[0]} × {ps[1]} cm</td><td>{ok}</td></tr>"
+        try:
+            img = Image.open(BytesIO(file_bytes))
+        except Exception as e:
+            st.error(f"Erro ao abrir a imagem: {e}")
+            st.stop()
 
-        st.markdown(f"""
-        <table class="print-table">
-            <thead><tr><th>PPI</th><th>Qualidade</th><th>Tamanho</th><th>Viável</th></tr></thead>
-            <tbody>{table_rows}</tbody>
-        </table>
-        """, unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        with st.spinner("Analisando imagem..."):
+            tech = analyze_technical(img, file_size)
+            quality = analyze_quality(img, tech)
 
-    with col_suggestions:
-        # Problemas
-        if quality["issues"]:
+        dpi_eff = get_dpi_effective(tech["width"], tech["height"])
+        res_label, res_color_name = get_resolution_label(tech["width"], tech["height"])
+        sharp_label = get_sharpness_label(tech["laplacian_var"])
+
+        # ── Layout principal ────────────────────────────────────────────────
+        col_preview, col_metrics = st.columns([3, 2])
+
+        # Preview da imagem
+        with col_preview:
             st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="card-title">⚠️ Problemas Encontrados</div>', unsafe_allow_html=True)
-            for issue in quality["issues"]:
-                st.markdown(render_suggestion("⚠️", "", issue), unsafe_allow_html=True)
+            st.markdown(f'<div class="card-title">🖼️ Preview — {uploaded.name}</div>', unsafe_allow_html=True)
+            st.image(img, use_container_width=True)
+
+            # Tags de info rápida
+            tags_html = f"""
+            <div style="margin-top:0.8rem;">
+                <span class="tech-detail">📐 {tech['width']}×{tech['height']} px</span>
+                <span class="tech-detail">📁 {tech['format']}</span>
+                <span class="tech-detail">💾 {tech['file_size']/1024:.0f} KB</span>
+                <span class="tech-detail">🎨 {tech['mode']} ({tech['bits']}bits)</span>
+                <span class="tech-detail">🔢 {tech['unique_colors']:,} cores</span>
+            """
+            if tech.get("has_transparency"):
+                tags_html += '<span class="tech-detail">✅ Transparência</span>'
+            else:
+                tags_html += '<span class="tech-detail">❌ Sem transparência</span>'
+            if tech.get("icc"):
+                tags_html += '<span class="tech-detail">✅ ICC</span>'
+            else:
+                tags_html += '<span class="tech-detail">⚠️ Sem ICC</span>'
+            tags_html += "</div>"
+            st.markdown(tags_html, unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-        # Recomendações
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">💡 Sugestões de Melhoria</div>', unsafe_allow_html=True)
+        # Métricas e veredito
+        with col_metrics:
+            # Card de métricas
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="card-title">📊 Análise</div>', unsafe_allow_html=True)
 
-        suggestion_icons = ["🔧", "🎨", "📐", "🖨️", "✨", "📁"]
-        for i, rec in enumerate(quality["recommendations"]):
-            icon = suggestion_icons[i % len(suggestion_icons)]
-            # Extrair primeira frase como título
-            parts = rec.split(".", 1)
-            title = parts[0] + "."
-            detail = parts[1].strip() if len(parts) > 1 else ""
-            st.markdown(render_suggestion(icon, title, detail), unsafe_allow_html=True)
+            dpi_icon_class = "green" if dpi_eff >= 300 else ("orange" if dpi_eff >= 150 else "red")
+            dpi_label = "Excelente" if dpi_eff >= 300 else ("Boa" if dpi_eff >= 200 else ("Mínima" if dpi_eff >= 150 else "Insuficiente"))
 
-        st.markdown('</div>', unsafe_allow_html=True)
+            metrics_html = ""
+            metrics_html += render_metric("📐", dpi_icon_class, "RESOLUÇÃO EFETIVA (DPI P/ 25×30CM)", f"{dpi_eff} DPI ({dpi_label})")
+            metrics_html += render_metric("🎨", "blue" if tech["unique_colors"] >= 10000 else "orange", "QUALIDADE DE PX", f"{res_label} ({tech['width']}×{tech['height']})")
 
-        # Compatibilidade com estampas
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">👕 Compatibilidade com Estampas</div>', unsafe_allow_html=True)
-        compat_rows = ""
-        for name, (tw, th) in STAMP_SIZES.items():
-            checks = []
+            contrast_val = tech.get("lum_std", 0)
+            contrast_label = "Alto" if contrast_val > 40 else ("Médio" if contrast_val > 20 else "Baixo")
+            contrast_class = "green" if contrast_val > 40 else ("orange" if contrast_val > 20 else "red")
+            metrics_html += render_metric("🔲", contrast_class, "CONTRASTE", f"{contrast_label} ({contrast_val:.1f})")
+
+            metrics_html += render_metric("✨", "purple", "NITIDEZ", f"{sharp_label}")
+
+            ps300 = tech["print_sizes"][300]
+            print_class = "green" if ps300[0] >= 25 else ("orange" if ps300[0] >= 15 else "red")
+            metrics_html += render_metric("🖨️", print_class, "IMPRESSÃO A 300 DPI", f"{ps300[0]}×{ps300[1]} cm")
+
+            st.markdown(metrics_html, unsafe_allow_html=True)
+
+            # Veredito
+            st.markdown(f"""
+            <div class="verdict {quality['verdict_class']}">
+                <div class="verdict-label">VEREDITO</div>
+                <div class="verdict-text">{quality['verdict_icon']} {quality['verdict']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── Linha 2: Notas + Sugestões ──────────────────────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        col_scores, col_suggestions = st.columns([1, 1])
+
+        with col_scores:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="card-title">📈 Notas</div>', unsafe_allow_html=True)
+            scores = quality["scores"]
+            bars = ""
+            bars += render_score_bar("Qualidade Técnica", scores["technical"])
+            bars += render_score_bar("Qualidade Visual", scores["visual"])
+            bars += render_score_bar("Prep. Impressão", scores["print"])
+            st.markdown(bars, unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # Tabela de impressão
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="card-title">🖨️ Tamanhos de Impressão</div>', unsafe_allow_html=True)
+            table_rows = ""
             for ppi in [300, 200, 150]:
                 ps = tech["print_sizes"][ppi]
-                checks.append("✅" if ps[0] >= tw and ps[1] >= th else "❌")
-            compat_rows += f"<tr><td>{name}</td><td>{checks[0]}</td><td>{checks[1]}</td><td>{checks[2]}</td></tr>"
+                quality_label = "Ótima" if ppi == 300 else ("Boa" if ppi == 200 else "Mínima")
+                ok = "✅" if ps[0] >= 20 or ps[1] >= 20 else "❌"
+                table_rows += f"<tr><td>{ppi} PPI</td><td>{quality_label}</td><td>{ps[0]} × {ps[1]} cm</td><td>{ok}</td></tr>"
 
-        st.markdown(f"""
-        <table class="print-table">
-            <thead><tr><th>Tamanho</th><th>300 PPI</th><th>200 PPI</th><th>150 PPI</th></tr></thead>
-            <tbody>{compat_rows}</tbody>
-        </table>
+            st.markdown(f"""
+            <table class="print-table">
+                <thead><tr><th>PPI</th><th>Qualidade</th><th>Tamanho</th><th>Viável</th></tr></thead>
+                <tbody>{table_rows}</tbody>
+            </table>
+            """, unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with col_suggestions:
+            # Problemas
+            if quality["issues"]:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.markdown('<div class="card-title">⚠️ Problemas Encontrados</div>', unsafe_allow_html=True)
+                for issue in quality["issues"]:
+                    st.markdown(render_suggestion("⚠️", "", issue), unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            # Recomendações
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="card-title">💡 Sugestões de Melhoria</div>', unsafe_allow_html=True)
+
+            suggestion_icons = ["🔧", "🎨", "📐", "🖨️", "✨", "📁"]
+            for i, rec in enumerate(quality["recommendations"]):
+                icon = suggestion_icons[i % len(suggestion_icons)]
+                # Extrair primeira frase como título
+                parts = rec.split(".", 1)
+                title = parts[0] + "."
+                detail = parts[1].strip() if len(parts) > 1 else ""
+                st.markdown(render_suggestion(icon, title, detail), unsafe_allow_html=True)
+
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # Compatibilidade com estampas
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="card-title">👕 Compatibilidade com Estampas</div>', unsafe_allow_html=True)
+            compat_rows = ""
+            for name, (tw, th) in STAMP_SIZES.items():
+                checks = []
+                for ppi in [300, 200, 150]:
+                    ps = tech["print_sizes"][ppi]
+                    checks.append("✅" if ps[0] >= tw and ps[1] >= th else "❌")
+                compat_rows += f"<tr><td>{name}</td><td>{checks[0]}</td><td>{checks[1]}</td><td>{checks[2]}</td></tr>"
+
+            st.markdown(f"""
+            <table class="print-table">
+                <thead><tr><th>Tamanho</th><th>300 PPI</th><th>200 PPI</th><th>150 PPI</th></tr></thead>
+                <tbody>{compat_rows}</tbody>
+            </table>
+            """, unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    else:
+        # ── Estado vazio ────────────────────────────────────────────────────
+        st.markdown("""
+        <div style="display:flex; gap:1.5rem; margin-top:1rem;">
+            <div class="card" style="flex:1; text-align:center; padding:2rem;">
+                <div style="font-size:2.5rem; margin-bottom:0.5rem;">📐</div>
+                <div style="font-weight:700; color:#1a365d; margin-bottom:0.3rem;"> Análise Técnica</div>
+                <div style="font-size:0.85rem; color:#5f6368;">
+                    Resolução, formato, transparência, cores, nitidez,
+                    detecção de upscale e tamanhos de impressão.
+                </div>
+            </div>
+            <div class="card" style="flex:1; text-align:center; padding:2rem;">
+                <div style="font-size:2.5rem; margin-bottom:0.5rem;">🎨</div>
+                <div style="font-weight:700; color:#1a365d; margin-bottom:0.3rem;"> Qualidade e Veredito</div>
+                <div style="font-size:0.85rem; color:#5f6368;">
+                    Notas de 0 a 10, veredito automático, problemas
+                    encontrados e sugestões de melhoria.
+                </div>
+            </div>
+        </div>
         """, unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
 
-else:
-    # ── Estado vazio ────────────────────────────────────────────────────
-    st.markdown("""
-    <div style="display:flex; gap:1.5rem; margin-top:1rem;">
-        <div class="card" style="flex:1; text-align:center; padding:2rem;">
-            <div style="font-size:2.5rem; margin-bottom:0.5rem;">📐</div>
-            <div style="font-weight:700; color:#1a365d; margin-bottom:0.3rem;"> Análise Técnica</div>
+# ── Aba: Vetorização ────────────────────────────────────────────────────────
+with tab_vec:
+    col_vup, _ = st.columns([1, 2])
+    with col_vup:
+        st.markdown("""
+        <div class="card">
+            <div class="card-title">🧬 Verificar Vetorização</div>
+            <p style="font-size:0.85rem; color:#5f6368; margin-bottom:0.5rem;">
+                Descobre se o arquivo é vetor de verdade ou imagem "embrulhada".<br>
+                Suporta SVG, PDF, AI (compatível com PDF) e imagens raster.<br>
+                EPS: exporte como PDF antes.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    vec_file = st.file_uploader(
+        "upload_vetor",
+        type=list(VECTOR_EXTS + RASTER_EXTS),
+        label_visibility="collapsed",
+        key="vec_uploader",
+    )
+
+    if vec_file is not None:
+        vbytes = vec_file.getvalue()
+        ext = vec_file.name.rsplit(".", 1)[-1].lower()
+
+        # ── Raster: não é vetor, mas avalia se vale vetorizar ──
+        if ext in RASTER_EXTS:
+            try:
+                vimg = Image.open(BytesIO(vbytes))
+            except Exception as e:
+                st.error(f"Erro ao abrir a imagem: {e}")
+                st.stop()
+            rv = analyze_raster_vectorizability(vimg)
+            lvl_label, lvl_class, lvl_desc = rv["level"]
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                st.markdown(f'<div class="card-title">🖼️ Preview — {vec_file.name}</div>', unsafe_allow_html=True)
+                st.image(vimg, use_container_width=True)
+            with c2:
+                html = '<div class="card"><div class="card-title">🧬 Vetorização</div>'
+                html += render_metric("📁", "blue", "FORMATO", f"{ext.upper()} (raster / pixels)")
+                html += render_metric("📐", "blue", "DIMENSÕES", f"{vimg.width}×{vimg.height} px")
+                html += render_metric("🎨", lvl_class, "POTENCIAL DE VETORIZAÇÃO",
+                                      f"{lvl_label} ({rv['top16_pct']:.0f}% em 16 cores)")
+                html += """
+                <div class="verdict rejected">
+                    <div class="verdict-label">VEREDITO</div>
+                    <div class="verdict-text">❌ NÃO É VETOR</div>
+                </div></div>"""
+                st.markdown(html, unsafe_allow_html=True)
+                st.markdown(render_suggestion("💡", "Sobre vetorizar.", lvl_desc), unsafe_allow_html=True)
+                st.caption("Para resolução/DPI deste arquivo, use a aba Análise de DPI.")
+
+        # ── SVG / PDF / AI ──
+        else:
+            try:
+                with st.spinner("Inspecionando arquivo..."):
+                    if ext == "svg":
+                        va = analyze_svg(vbytes)
+                    else:
+                        va = analyze_pdf(vbytes, ext.upper())
+            except Exception as e:
+                if ext == "ai":
+                    st.error("Não consegui ler este .ai. Ele precisa ter sido salvo com "
+                             "\"Criar arquivo compatível com PDF\" no Illustrator — ou exporte como PDF.")
+                else:
+                    st.error(f"Erro ao ler o arquivo: {e}")
+                st.stop()
+
+            vd = va["verdict"]
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                st.markdown(f'<div class="card-title">🖼️ Preview — {vec_file.name}</div>', unsafe_allow_html=True)
+                if "preview_png" in va:
+                    st.image(va["preview_png"], use_container_width=True)
+                else:
+                    st.markdown(f'<div class="img-preview">{va["preview_html"]}</div>', unsafe_allow_html=True)
+                tags = "".join(f'<span class="tech-detail">{k}: {v:,}</span>' for k, v in va["vec_detail"].items() if v)
+                if va["kind"] != "SVG":
+                    tags += f'<span class="tech-detail">📄 {va["pages"]} pág.</span>'
+                st.markdown(f'<div style="margin-top:0.8rem;">{tags}</div>', unsafe_allow_html=True)
+
+            with c2:
+                html = '<div class="card"><div class="card-title">🧬 Vetorização</div>'
+                html += render_metric("📁", "blue", "FORMATO", va["kind"])
+                html += render_metric("✏️", "green" if va["n_vec"] else "red",
+                                      "ELEMENTOS VETORIAIS", f"{va['n_vec']:,}")
+                html += render_metric("🖼️", "green" if va["n_img"] == 0 else "orange",
+                                      "IMAGENS RASTER EMBUTIDAS", f"{va['n_img']}")
+                if va["coverage"] is not None and va["n_img"]:
+                    cov = va["coverage"] * 100
+                    html += render_metric("📊", "red" if cov >= 90 else "orange",
+                                          "ÁREA COBERTA POR IMAGEM", f"{cov:.0f}%")
+                html += f"""
+                <div class="verdict {vd['cls']}">
+                    <div class="verdict-label">VEREDITO</div>
+                    <div class="verdict-text">{vd['icon']} {vd['label']}</div>
+                </div></div>"""
+                st.markdown(html, unsafe_allow_html=True)
+                st.markdown(render_suggestion("ℹ️", "O que isso significa.", vd["desc"]), unsafe_allow_html=True)
+                if va["pages"] > va["pages_analyzed"]:
+                    st.caption(f"Analisadas as primeiras {va['pages_analyzed']} de {va['pages']} páginas.")
+
+            # Detalhe das imagens embutidas (o que define a qualidade de impressão delas)
+            if va["images"]:
+                rows = ""
+                for i, im in enumerate(va["images"][:30], 1):
+                    px = f"{im['px'][0]}×{im['px'][1]} px" if im.get("px") else "—"
+                    if "dpi" in im:
+                        dpi = im["dpi"]
+                        ok = "✅" if dpi >= 300 else ("⚠️" if dpi >= 150 else "❌")
+                        rows += (f"<tr><td>{i}</td><td>{im['page']}</td><td>{px}</td>"
+                                 f"<td>{im['cm'][0]} × {im['cm'][1]} cm</td><td>{dpi} DPI {ok}</td></tr>")
+                    else:
+                        origem = "embutida" if im["embedded"] else "link externo"
+                        rows += f"<tr><td>{i}</td><td>—</td><td>{px}</td><td>{origem}</td><td>—</td></tr>"
+                st.markdown(f"""
+                <div class="card">
+                    <div class="card-title">🔎 Imagens Raster Encontradas</div>
+                    <table class="print-table">
+                        <thead><tr><th>#</th><th>Pág.</th><th>Pixels</th><th>Tamanho no doc.</th><th>DPI efetivo</th></tr></thead>
+                        <tbody>{rows}</tbody>
+                    </table>
+                </div>
+                """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div class="card" style="text-align:center; padding:2rem; margin-top:1rem;">
+            <div style="font-size:2.5rem; margin-bottom:0.5rem;">🧬</div>
+            <div style="font-weight:700; color:#1a365d; margin-bottom:0.3rem;">Vetor de verdade?</div>
             <div style="font-size:0.85rem; color:#5f6368;">
-                Resolução, formato, transparência, cores, nitidez,
-                detecção de upscale e tamanhos de impressão.
+                Conta formas e textos vetoriais, detecta imagens raster escondidas dentro de
+                SVG/PDF/AI e calcula o DPI efetivo de cada uma no tamanho em que foi colocada.
             </div>
         </div>
-        <div class="card" style="flex:1; text-align:center; padding:2rem;">
-            <div style="font-size:2.5rem; margin-bottom:0.5rem;">🎨</div>
-            <div style="font-weight:700; color:#1a365d; margin-bottom:0.3rem;"> Qualidade e Veredito</div>
-            <div style="font-size:0.85rem; color:#5f6368;">
-                Notas de 0 a 10, veredito automático, problemas
-                encontrados e sugestões de melhoria.
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
 # Footer
 st.markdown("""
 <div style="text-align:center; padding:2rem 0 1rem; color:#9ca3af; font-size:0.75rem;">
-    Stampa Checker v1.0 — HallDevs
+    Stampa Checker v1.1 — HallDevs
 </div>
 """, unsafe_allow_html=True)
-
-
